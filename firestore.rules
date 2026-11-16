@@ -1,0 +1,292 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default-deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 4 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Shared QR code check helpers for atomic ride registration transactions
+    function qrExistsBefore(codeId) {
+      return codeId is string &&
+             codeId.size() >= 4 &&
+             codeId.size() <= 64 &&
+             exists(/databases/$(database)/documents/qrcodes/$(codeId));
+    }
+
+    function isValidActiveQrClaim(codeId, expectedDriverId) {
+      return qrExistsBefore(codeId) &&
+             get(/databases/$(database)/documents/qrcodes/$(codeId)).data.status == 'ACTIVE' &&
+             get(/databases/$(database)/documents/qrcodes/$(codeId)).data.driverId == expectedDriverId &&
+             get(/databases/$(database)/documents/qrcodes/$(codeId)).data.expiresAt > request.time &&
+             getAfter(/databases/$(database)/documents/qrcodes/$(codeId)).data.status == 'USED';
+    }
+
+    // 1. CLIENTS COLLECTION
+    function isValidClient(data) {
+      return data.id is string && data.id.size() >= 4 && data.id.size() <= 128 &&
+             data.driverId is string && data.driverId.size() >= 1 && data.driverId.size() <= 128 &&
+             (!('passengerUid' in data) || (data.passengerUid is string && data.passengerUid.size() <= 128)) &&
+             (!('lastQrCodeId' in data) || (data.lastQrCodeId is string && data.lastQrCodeId.size() <= 64)) &&
+             data.name is string && data.name.size() >= 2 && data.name.size() <= 100 &&
+             data.phone is string && data.phone.size() >= 8 && data.phone.size() <= 30 &&
+             data.totalRides is int && data.totalRides >= 0 &&
+             data.points is int && data.points >= 0 && data.points < 10 &&
+             data.rewardsAvailable is int && data.rewardsAvailable >= 0 &&
+             data.rewardsRedeemed is int && data.rewardsRedeemed >= 0 &&
+             (!('isArchived' in data) || data.isArchived is bool) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp &&
+             data.updatedAt <= request.time;
+    }
+
+    match /clients/{clientId} {
+      // Driver can list their own clients; passenger can query clients linked to their UID
+      allow list: if isSignedIn() && (
+        existing().driverId == request.auth.uid ||
+        existing().passengerUid == request.auth.uid
+      );
+
+      // Exact document read: non-existent check (first ride), owning driver, linked passenger,
+      // or strictly unowned pre-migration phone-keyed doc (never exposes driver-owned PII)
+      allow get: if isSignedIn() && (
+        resource == null ||
+        existing().driverId == request.auth.uid ||
+        (('passengerUid' in existing()) && existing().passengerUid == request.auth.uid) ||
+        (!('driverId' in existing()) && existing().phone == clientId)
+      );
+
+      // Client creation is ONLY allowed via an atomic transaction consuming an ACTIVE, non-expired QR code
+      allow create: if isSignedIn() &&
+                       isValidId(clientId) &&
+                       incoming().id == clientId &&
+                       incoming().driverId is string &&
+                       incoming().passengerUid == request.auth.uid &&
+                       incoming().totalRides == 1 &&
+                       incoming().points == 1 &&
+                       incoming().rewardsAvailable == 0 &&
+                       incoming().rewardsRedeemed == 0 &&
+                       incoming().isArchived == false &&
+                       incoming().lastQrCodeId is string &&
+                       incoming().createdAt <= request.time &&
+                       incoming().keys().hasAll(['id', 'driverId', 'passengerUid', 'lastQrCodeId', 'name', 'phone', 'totalRides', 'points', 'rewardsAvailable', 'rewardsRedeemed', 'isArchived', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['id', 'driverId', 'passengerUid', 'lastQrCodeId', 'name', 'phone', 'totalRides', 'points', 'rewardsAvailable', 'rewardsRedeemed', 'isArchived', 'createdAt', 'updatedAt']) &&
+                       isValidClient(incoming()) &&
+                       isValidActiveQrClaim(incoming().lastQrCodeId, incoming().driverId);
+
+      // Client updates split into strictly validated operations:
+      // (A) Ride score increment via atomic QR consumption (+1 ride, +1 point, 10 pts -> +1 free ride)
+      // (B) Driver reward redemption (-1 rewardsAvailable, +1 rewardsRedeemed, prevents negative balance)
+      // (C) Driver archive/restore/profile update (points, rides, rewards stay immutable)
+      // (D) One-time legacy doc ownership migration (only when driverId was previously missing)
+      allow update: if isSignedIn() &&
+                       isValidId(clientId) &&
+                       isValidClient(incoming()) &&
+                       incoming().id == existing().id &&
+                       incoming().createdAt == existing().createdAt &&
+                       (
+                         // (A) QR-backed ride score update (phone and existing passengerUid immutable once set)
+                         (
+                           (!('driverId' in existing()) || incoming().driverId == existing().driverId) &&
+                           (!('phone' in existing()) || existing().phone.size() == 0 || incoming().phone == existing().phone) &&
+                           (!('passengerUid' in existing()) || existing().passengerUid.size() == 0 || existing().passengerUid.matches('^web_.*') || existing().passengerUid == request.auth.uid || existing().driverId == request.auth.uid) &&
+                           incoming().passengerUid == request.auth.uid &&
+                           incoming().lastQrCodeId is string &&
+                           incoming().totalRides == existing().totalRides + 1 &&
+                           incoming().rewardsRedeemed == existing().rewardsRedeemed &&
+                           incoming().rewardsAvailable >= existing().rewardsAvailable &&
+                           (incoming().points + (incoming().rewardsAvailable - existing().rewardsAvailable) * 10) == (existing().points + 1) &&
+                           incoming().isArchived == false &&
+                           incoming().diff(existing()).affectedKeys().hasOnly(['driverId', 'passengerUid', 'lastQrCodeId', 'name', 'phone', 'totalRides', 'points', 'rewardsAvailable', 'rewardsRedeemed', 'isArchived', 'updatedAt']) &&
+                           isValidActiveQrClaim(incoming().lastQrCodeId, incoming().driverId)
+                         )
+                         ||
+                         // (B) Driver reward redemption
+                         (
+                           existing().driverId == request.auth.uid &&
+                           incoming().driverId == existing().driverId &&
+                           existing().rewardsAvailable >= 1 &&
+                           incoming().rewardsAvailable == existing().rewardsAvailable - 1 &&
+                           incoming().rewardsRedeemed == existing().rewardsRedeemed + 1 &&
+                           incoming().diff(existing()).affectedKeys().hasOnly(['rewardsAvailable', 'rewardsRedeemed', 'updatedAt'])
+                         )
+                         ||
+                         // (C) Driver archive / restore / edit name & phone (loyalty counters untouched)
+                         (
+                           existing().driverId == request.auth.uid &&
+                           incoming().driverId == existing().driverId &&
+                           incoming().diff(existing()).affectedKeys().hasOnly(['name', 'phone', 'isArchived', 'updatedAt'])
+                         )
+                         ||
+                         // (D) Legacy migration: claim unowned doc for current driver without altering counters
+                         (
+                           !('driverId' in existing()) &&
+                           incoming().driverId == request.auth.uid &&
+                           incoming().isArchived == false &&
+                           incoming().diff(existing()).affectedKeys().hasOnly(['driverId', 'isArchived', 'updatedAt'])
+                         )
+                       );
+
+      // Permanent deletion allowed only by owning driver
+      allow delete: if isSignedIn() && existing().driverId == request.auth.uid;
+    }
+
+    // 2. QR CODES COLLECTION (Single-use, 15-min validity)
+    function isValidQrCode(data) {
+      return data.codeId is string && data.codeId.size() >= 4 && data.codeId.size() <= 64 &&
+             data.driverId is string && data.driverId.size() >= 1 && data.driverId.size() <= 128 &&
+             data.driverName is string && data.driverName.size() >= 1 && data.driverName.size() <= 100 &&
+             data.status in ['ACTIVE', 'USED', 'EXPIRED'] &&
+             (!('usedByPhone' in data) || (data.usedByPhone is string && data.usedByPhone.size() >= 8 && data.usedByPhone.size() <= 30)) &&
+             (!('usedByName' in data) || (data.usedByName is string && data.usedByName.size() >= 2 && data.usedByName.size() <= 100)) &&
+             (!('usedAt' in data) || (data.usedAt is timestamp && data.usedAt <= request.time)) &&
+             data.createdAt is timestamp &&
+             data.expiresAt is timestamp;
+    }
+
+    match /qrcodes/{codeId} {
+      // Exact get allowed so signed-in passengers can check/claim a scanned codeId
+      allow get: if isSignedIn();
+      // Listing QR codes restricted strictly to the owning driver
+      allow list: if isSignedIn() && existing().driverId == request.auth.uid;
+
+      allow create: if isSignedIn() &&
+                       isValidId(codeId) &&
+                       incoming().codeId == codeId &&
+                       incoming().driverId == request.auth.uid &&
+                       incoming().status == 'ACTIVE' &&
+                       !('usedByPhone' in incoming()) &&
+                       !('usedByName' in incoming()) &&
+                       !('usedAt' in incoming()) &&
+                       incoming().createdAt <= request.time &&
+                       incoming().expiresAt > request.time &&
+                       incoming().expiresAt <= request.time + duration.value(20, 'm') &&
+                       incoming().keys().hasAll(['codeId', 'driverId', 'driverName', 'status', 'createdAt', 'expiresAt']) &&
+                       incoming().keys().hasOnly(['codeId', 'driverId', 'driverName', 'status', 'createdAt', 'expiresAt']) &&
+                       isValidQrCode(incoming());
+
+      // Single-use claim: only ACTIVE & non-expired codes can transition to USED
+      allow update: if isSignedIn() &&
+                       isValidId(codeId) &&
+                       isValidQrCode(incoming()) &&
+                       incoming().codeId == existing().codeId &&
+                       incoming().driverId == existing().driverId &&
+                       incoming().createdAt == existing().createdAt &&
+                       existing().status == 'ACTIVE' &&
+                       existing().expiresAt > request.time &&
+                       incoming().status == 'USED' &&
+                       incoming().usedByPhone is string && incoming().usedByPhone.size() >= 8 &&
+                       incoming().usedByName is string && incoming().usedByName.size() >= 2 &&
+                       incoming().usedAt is timestamp && incoming().usedAt <= request.time &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['status', 'usedByPhone', 'usedByName', 'usedAt']);
+
+      allow delete: if false;
+    }
+
+    // 3. RIDES COLLECTION (Audit log tied to QR codes)
+    function isValidRide(data) {
+      return data.id is string && data.id.size() >= 4 && data.id.size() <= 128 &&
+             data.clientPhone is string && data.clientPhone.size() >= 8 && data.clientPhone.size() <= 30 &&
+             data.clientName is string && data.clientName.size() >= 2 && data.clientName.size() <= 100 &&
+             data.driverId is string && data.driverId.size() >= 1 && data.driverId.size() <= 128 &&
+             data.driverName is string && data.driverName.size() >= 1 && data.driverName.size() <= 100 &&
+             data.qrCodeId is string && data.qrCodeId.size() >= 4 && data.qrCodeId.size() <= 64 &&
+             data.pointsEarned is int && data.pointsEarned == 1 &&
+             data.timestamp is timestamp && data.timestamp <= request.time;
+    }
+
+    match /rides/{rideId} {
+      allow get, list: if isSignedIn() && existing().driverId == request.auth.uid;
+
+      // Ride can ONLY be created inside a transaction that consumes a valid ACTIVE unexpired QR code for that driverId & matching clientPhone
+      allow create: if isSignedIn() &&
+                       isValidId(rideId) &&
+                       incoming().id == rideId &&
+                       incoming().keys().hasAll(['id', 'clientPhone', 'clientName', 'driverId', 'driverName', 'qrCodeId', 'pointsEarned', 'timestamp']) &&
+                       incoming().keys().hasOnly(['id', 'clientPhone', 'clientName', 'driverId', 'driverName', 'qrCodeId', 'pointsEarned', 'timestamp']) &&
+                       isValidRide(incoming()) &&
+                       isValidActiveQrClaim(incoming().qrCodeId, incoming().driverId) &&
+                       getAfter(/databases/$(database)/documents/qrcodes/$(incoming().qrCodeId)).data.usedByPhone == incoming().clientPhone;
+
+      // Immutable against edits; owning driver can delete only when purging a permanently deleted client
+      allow update: if false;
+      allow delete: if isSignedIn() && existing().driverId == request.auth.uid;
+    }
+
+    // 4. REWARDS COLLECTION
+    function isValidReward(data) {
+      return data.id is string && data.id.size() >= 4 && data.id.size() <= 128 &&
+             data.clientPhone is string && data.clientPhone.size() >= 8 && data.clientPhone.size() <= 30 &&
+             data.clientName is string && data.clientName.size() >= 2 && data.clientName.size() <= 100 &&
+             data.driverId is string && data.driverId.size() >= 1 && data.driverId.size() <= 128 &&
+             (!('qrCodeId' in data) || (data.qrCodeId is string && data.qrCodeId.size() <= 64)) &&
+             data.status in ['AVAILABLE', 'REDEEMED'] &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             (!('redeemedAt' in data) || (data.redeemedAt is timestamp && data.redeemedAt <= request.time));
+    }
+
+    match /rewards/{rewardId} {
+      allow get, list: if isSignedIn() && existing().driverId == request.auth.uid;
+
+      allow create: if isSignedIn() &&
+                       isValidId(rewardId) &&
+                       incoming().id == rewardId &&
+                       isValidReward(incoming()) &&
+                       (
+                         // Driver redeeming a reward directly (legacy clients without pre-created AVAILABLE doc)
+                         (
+                           incoming().driverId == request.auth.uid &&
+                           incoming().status == 'REDEEMED' &&
+                           'redeemedAt' in incoming() &&
+                           incoming().keys().hasAll(['id', 'clientPhone', 'clientName', 'driverId', 'status', 'createdAt', 'redeemedAt']) &&
+                           incoming().keys().hasOnly(['id', 'clientPhone', 'clientName', 'driverId', 'qrCodeId', 'status', 'createdAt', 'redeemedAt'])
+                         )
+                         ||
+                         // Passenger atomically unlocking an AVAILABLE reward upon 10th-point QR consumption
+                         (
+                           rewardId == ('REW-' + incoming().qrCodeId) &&
+                           incoming().status == 'AVAILABLE' &&
+                           !('redeemedAt' in incoming()) &&
+                           'qrCodeId' in incoming() &&
+                           incoming().qrCodeId is string &&
+                           incoming().keys().hasAll(['id', 'clientPhone', 'clientName', 'driverId', 'qrCodeId', 'status', 'createdAt']) &&
+                           incoming().keys().hasOnly(['id', 'clientPhone', 'clientName', 'driverId', 'qrCodeId', 'status', 'createdAt']) &&
+                           isValidActiveQrClaim(incoming().qrCodeId, incoming().driverId) &&
+                           getAfter(/databases/$(database)/documents/qrcodes/$(incoming().qrCodeId)).data.usedByPhone == incoming().clientPhone
+                         )
+                       );
+
+      allow update: if isSignedIn() &&
+                       isValidId(rewardId) &&
+                       existing().driverId == request.auth.uid &&
+                       incoming().driverId == existing().driverId &&
+                       isValidReward(incoming()) &&
+                       incoming().id == existing().id &&
+                       incoming().clientPhone == existing().clientPhone &&
+                       incoming().createdAt == existing().createdAt &&
+                       existing().status == 'AVAILABLE' &&
+                       incoming().status == 'REDEEMED' &&
+                       'redeemedAt' in incoming() &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['status', 'redeemedAt']);
+
+      allow delete: if isSignedIn() && existing().driverId == request.auth.uid;
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "CLIENTE VIP",
+  "description": "Aplicativo de fidelidade para motoristas e passageiros com corridas, pontos, recompensas e QR code de uso único.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
