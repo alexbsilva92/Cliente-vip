@@ -1,6 +1,8 @@
 *
 !package.json
 !server.js
-!.build-outputs
-!.build-outputs/app-debug.apk
-!Cliente_VIP_src.zip
+!qrcode-svg.js
+!web-views.js
+!public
+public/*
+!public/icons

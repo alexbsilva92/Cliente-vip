@@ -64,13 +64,12 @@ service cloud.firestore {
         existing().passengerUid == request.auth.uid
       );
 
-      // Exact document read: non-existent check (first ride), owning driver, linked passenger,
-      // or strictly unowned pre-migration phone-keyed doc (never exposes driver-owned PII)
+      // Exact document read: non-existent check (first ride), owning driver, or linked passenger
+      // (prevents guessing phone numbers to read unowned legacy client documents).
       allow get: if isSignedIn() && (
         resource == null ||
         existing().driverId == request.auth.uid ||
-        (('passengerUid' in existing()) && existing().passengerUid == request.auth.uid) ||
-        (!('driverId' in existing()) && existing().phone == clientId)
+        (('passengerUid' in existing()) && existing().passengerUid == request.auth.uid)
       );
 
       // Client creation is ONLY allowed via an atomic transaction consuming an ACTIVE, non-expired QR code

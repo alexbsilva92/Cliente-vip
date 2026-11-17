@@ -818,3 +818,26 @@ test("22. Ride/Reward consistency: phone mismatch with consumed QR usedByPhone i
   await assertFails(batch.commit());
 });
 
+test("23. Phone guessing blocked on Firestore: random user cannot read unowned legacy clients/{phone}", async () => {
+  const now = new Date();
+  const legacyPhone = "11944443333";
+  await testEnv.withSecurityRulesDisabled(async (ctx) => {
+    await ctx.firestore().collection("clients").doc(legacyPhone).set({
+      id: legacyPhone,
+      name: "Cliente Legado Confidencial",
+      phone: legacyPhone,
+      totalRides: 5,
+      points: 5,
+      rewardsAvailable: 0,
+      rewardsRedeemed: 0,
+      createdAt: now,
+      updatedAt: now,
+    });
+  });
+
+  const randomPassengerDb = testEnv.authenticatedContext(PASSENGER_B).firestore();
+  await assertFails(randomPassengerDb.collection("clients").doc(legacyPhone).get());
+  await assertFails(randomPassengerDb.collection("clients").where("phone", "==", legacyPhone).get());
+});
+
+
